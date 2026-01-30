@@ -1,0 +1,1323 @@
+import { inflate } from 'pako';
+import { Quat } from 'reze-engine';
+
+// ============================================================
+// FBX Parser - Pure FBX binary parsing and animation extraction
+// No MMD-specific conversions - returns raw animation data
+// ============================================================
+
+export type FBXProperty = boolean | number | bigint | string | boolean[] | number[] | bigint[] | ArrayBuffer;
+
+export interface FBXNode {
+	name: string;
+	props: FBXProperty[];
+	nodes: FBXNode[];
+}
+
+export type FBXData = FBXNode[];
+
+
+// Animation data structures
+export interface BoneHierarchy {
+	parent: string | null;  // Parent bone name, or null if root
+	children: string[];      // Child bone names
+}
+
+export interface AnimationClip {
+	name: string;
+	duration: number;
+	tracks: BoneTrack[];
+	positionTracks: PositionTrack[];
+	hierarchy?: Map<string, BoneHierarchy>;  // Bone name -> hierarchy info
+}
+
+export interface BoneRestPose {
+	lclRotation: [number, number, number];  // Euler in radians
+	lclTranslation: [number, number, number] | null;  // Bone position (head_local)
+	preRotation: [number, number, number] | null;
+	postRotation: [number, number, number] | null;
+}
+
+export interface BoneTrack {
+	name: string;
+	original_name: string;
+	times: number[];
+	quats: Quat[];
+	restPose: BoneRestPose | null;  // Rest pose for computing world quaternions
+}
+
+export interface PositionTrack {
+	name: string;
+	original_name: string;
+	times: number[];
+	positions: [number, number, number][];  // [x, y, z] for each keyframe
+}
+
+export class FBXReaderNode {
+	public fbxNode: FBXNode;
+
+	constructor(fbxNode: FBXNode) {
+		this.fbxNode = fbxNode;
+	}
+
+	private nodeFilter(a?: string | { [index: number]: FBXProperty }, b?: { [index: number]: FBXProperty }) {
+		let name: string | undefined = undefined;
+		let propFilter: { [index: number]: FBXProperty } | undefined = undefined;
+		if (typeof a === 'string') {
+			name = a;
+			if (typeof b !== 'undefined') propFilter = b;
+		} else propFilter = a;
+
+		let filter: (node: FBXNode) => boolean;
+		if (typeof propFilter !== 'undefined') {
+			const propFilterFunc = (node: FBXNode) => {
+				for (const prop in propFilter) {
+					const index = parseInt(prop);
+					if (node.props[index] !== propFilter![index]) return false;
+				}
+				return true;
+			};
+
+			if (typeof name !== 'undefined') {
+				filter = (node) => node.name === name && propFilterFunc(node);
+			} else {
+				filter = propFilterFunc;
+			}
+		} else {
+			filter = (node) => node.name === name;
+		}
+
+		return filter;
+	}
+
+	/**
+	 * Returns the first matching node
+	 * @param name filter for node name
+	 * @param propFilter filter for property by index and value
+	 */
+	node(name: string, propFilter?: { [index: number]: FBXProperty }): FBXReaderNode | undefined;
+	node(propFilter?: { [index: number]: FBXProperty }): FBXReaderNode | undefined;
+	node(a?: string | { [index: number]: FBXProperty }, b?: { [index: number]: FBXProperty }): FBXReaderNode | undefined {
+		const node = this.fbxNode.nodes.find(this.nodeFilter(a, b));
+		if (typeof node === 'undefined') return;
+		return new FBXReaderNode(node);
+	}
+
+	/**
+	 * Returns all matching nodes
+	 * @param name filter for node name
+	 * @param propFilter filter for property by index and value
+	 */
+	nodes(name: string, propFilter?: { [index: number]: FBXProperty }): FBXReaderNode[];
+	nodes(propFilter?: { [index: number]: FBXProperty }): FBXReaderNode[];
+	nodes(a?: string | { [index: number]: FBXProperty }, b?: { [index: number]: FBXProperty }): FBXReaderNode[] {
+		const nodes = this.fbxNode.nodes.filter(this.nodeFilter(a, b)).map((node) => new FBXReaderNode(node));
+		return nodes;
+	}
+
+	/**
+	 * Returns the value of the property
+	 * @param index index of the property
+	 * @param type test for property type, otherwise return undefined
+	 */
+	prop(index: number, type: 'boolean'): boolean | undefined;
+	prop(index: number, type: 'number'): number | undefined;
+	prop(index: number, type: 'bigint'): bigint | undefined;
+	prop(index: number, type: 'string'): string | undefined;
+	prop(index: number, type: 'boolean[]'): boolean[] | undefined;
+	prop(index: number, type: 'number[]'): number[] | undefined;
+	prop(index: number, type: 'bigint[]'): bigint[] | undefined;
+	prop(index: number): FBXProperty | undefined;
+	prop(
+		index: number,
+		type?: 'boolean' | 'number' | 'bigint' | 'string' | 'boolean[]' | 'number[]' | 'bigint[]'
+	): FBXProperty | undefined {
+		const prop = this.fbxNode.props[index];
+		if (typeof type === 'undefined') return prop;
+		if (type === 'boolean') return typeof prop === 'boolean' ? prop : undefined;
+		if (type === 'number') return typeof prop === 'number' ? prop : undefined;
+		if (type === 'bigint') return typeof prop === 'bigint' ? prop : undefined;
+		if (type === 'string') return typeof prop === 'string' ? prop : undefined;
+		// array types
+		if (!Array.isArray(prop)) return undefined;
+		if (prop.length == 0) return prop;
+		if (type === 'boolean[]') return typeof prop[0] === 'boolean' ? prop : undefined;
+		if (type === 'number[]') return typeof prop[0] === 'number' ? prop : undefined;
+		if (type === 'bigint[]') return typeof prop[0] === 'bigint' ? prop : undefined;
+		return undefined;
+	}
+}
+
+export class FBXReader extends FBXReaderNode {
+	public fbx: FBXData;
+
+	constructor(fbx: FBXData) {
+		const rootNode: FBXNode = {
+			name: '',
+			props: [],
+			nodes: fbx,
+		};
+
+		super(rootNode);
+
+		this.fbx = fbx;
+	}
+}
+
+// FBX Loader - animation only
+export class FBXLoader {
+	private path: string = '';
+
+	constructor() {}
+
+	setPath(path: string): this {
+		this.path = path;
+		return this;
+	}
+
+	async loadAsync(url: string): Promise<AnimationClip[]> {
+		return new Promise((resolve, reject) => {
+			this.load(url, resolve, undefined, reject);
+		});
+	}
+
+	load(
+		url: string,
+		onLoad?: (clips: AnimationClip[]) => void,
+		onProgress?: (progress: ProgressEvent) => void,
+		onError?: (error: Error) => void
+	) {
+		fetch(this.path + url)
+			.then(response => {
+				if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+				return response.arrayBuffer();
+			})
+			.then(buffer => {
+				try {
+					const fbxData = this.parse(buffer);
+					const reader = new FBXReader(fbxData);
+					const clips = new AnimationParser(reader).parse();
+					if (onLoad) onLoad(clips);
+				} catch (e) {
+					const error = e instanceof Error ? e : new Error(String(e));
+					if (onError) {
+						onError(error);
+					} else {
+						console.error(e);
+					}
+				}
+			})
+			.catch(error => {
+				if (onError) {
+					onError(error instanceof Error ? error : new Error(String(error)));
+				} else {
+					console.error(error);
+				}
+			});
+	}
+
+	private parse(buffer: ArrayBuffer): FBXData {
+		const binary = new Uint8Array(buffer);
+		return parseBinary(binary);
+	}
+}
+
+// Animation Parser - extracts only animation data
+class AnimationParser {
+	private reader: FBXReader;
+
+	constructor(reader: FBXReader) {
+		this.reader = reader;
+	}
+
+	parse(): AnimationClip[] {
+		const clips: AnimationClip[] = [];
+
+		// Find AnimationStack nodes
+		const objects = this.reader.node('Objects');
+		if (!objects) return clips;
+
+		const animationStacks = objects.nodes('AnimationStack');
+		
+		for (const stack of animationStacks) {
+			const clip = this.parseAnimationStack(stack);
+			if (clip) clips.push(clip);
+		}
+
+		return clips;
+	}
+
+	private parseAnimationStack(stack: FBXReaderNode): AnimationClip | null {
+		const name = stack.prop(1, 'string') || 'Animation';
+		
+		// Find connected AnimationLayer
+		const connections = this.reader.node('Connections');
+		if (!connections) return null;
+
+		const stackId = stack.prop(0, 'number');
+		if (stackId === undefined) return null;
+
+		// Find layers connected to this stack
+		// Connection format: C: "OO", <from>, <to>, <relationship>
+		// We want connections where <to> is stackId
+		const allConnections = connections.nodes('C');
+		const layerNodes = allConnections.filter(c => {
+			const toId = c.prop(2, 'number');
+			return toId === stackId;
+		});
+		
+		if (layerNodes.length === 0) return null;
+
+		const tracks: BoneTrack[] = [];
+		const positionTracks: PositionTrack[] = [];
+
+		// Process each layer
+		for (const layerConn of layerNodes) {
+			// Connection format: C: "OO", <from>, <to>, <relationship>
+			// layerConn.prop(1) is from (layer ID), prop(2) is to (stack ID)
+			const layerId = layerConn.prop(1, 'number');
+			if (layerId === undefined) continue;
+
+			const objects = this.reader.node('Objects');
+			if (!objects) continue;
+
+			const layer = objects.node('AnimationLayer', { 0: layerId });
+			if (!layer) continue;
+
+			// Find curve nodes connected to this layer
+			// Connections where <to> is layerId
+			const allConnections = this.reader.node('Connections');
+			if (!allConnections) continue;
+			const allLayerConns = allConnections.nodes('C');
+			const layerCurveNodes = allLayerConns.filter(c => {
+				const toId = c.prop(2, 'number');
+				return toId === layerId;
+			});
+			
+			for (const curveNodeConn of layerCurveNodes) {
+				// Connection format: C: "OO", <from>, <to>, <relationship>
+				// curveNodeConn.prop(1) is from (curveNode ID), prop(2) is to (layer ID)
+				const curveNodeId = curveNodeConn.prop(1, 'number');
+				if (curveNodeId === undefined) continue;
+
+				const curveNode = objects.node('AnimationCurveNode', { 0: curveNodeId });
+				if (!curveNode) continue;
+
+				// Get model ID from connection
+				// Find connections where <from> is curveNodeId and has a relationship
+				const allConns = this.reader.node('Connections');
+				if (!allConns) continue;
+				const allCurveConns = allConns.nodes('C');
+				const modelConn = allCurveConns.find(c => {
+					const fromId = c.prop(1, 'number');
+					const rel = c.prop(3, 'string');
+					return fromId === curveNodeId && rel && rel !== '';
+				});
+
+				if (!modelConn) continue;
+
+				const modelId = modelConn.prop(2, 'number'); // to is the model
+				if (modelId === undefined) continue;
+
+				const model = objects.node('Model', { 0: modelId });
+				if (!model) continue;
+
+				const modelName = model.prop(1, 'string') || '';
+				
+				// Get rotation data from model (like Three.js)
+				const preRotation = this.getPreRotation(model);
+				const postRotation = this.getPostRotation(model);
+				const lclRotation = this.getLclRotation(model);
+				const lclTranslation = this.getLclTranslation(model);
+				const eulerOrder = "ZXY";
+				
+				// Extract rest pose for bone hierarchy computation
+				const restPose: BoneRestPose | null = lclRotation ? {
+					lclRotation: lclRotation,
+					lclTranslation: lclTranslation,
+					preRotation: preRotation && preRotation.length >= 3 ? [preRotation[0], preRotation[1], preRotation[2]] as [number, number, number] : null,
+					postRotation: postRotation && postRotation.length >= 3 ? [postRotation[0], postRotation[1], postRotation[2]] as [number, number, number] : null,
+				} : null;
+				
+				// Parse rotation tracks (quaternions)
+				const track = this.parseCurveNode(curveNode, modelName, preRotation, postRotation, eulerOrder, restPose);
+				if (track) tracks.push(track);
+				
+				// Parse position tracks (translations)
+				const posTrack = this.parsePositionCurveNode(curveNode, modelName);
+				if (posTrack) positionTracks.push(posTrack);
+			}
+		}
+
+		if (tracks.length === 0 && positionTracks.length === 0) return null;
+
+		// Build bone hierarchy from Connections
+		const hierarchy = this.buildBoneHierarchy(tracks.map(t => t.name));
+
+		return {
+			name,
+			duration: -1,
+			tracks,
+			positionTracks,
+			hierarchy
+		};
+	}
+
+	private buildBoneHierarchy(boneNames: string[]): Map<string, BoneHierarchy> {
+		const hierarchy = new Map<string, BoneHierarchy>();
+		const allConns = this.reader.node('Connections');
+		if (!allConns) return hierarchy;
+
+		// Initialize all bones
+		for (const boneName of boneNames) {
+			hierarchy.set(boneName, { parent: null, children: [] });
+		}
+
+		// Find parent-child relationships
+		// Connection format: C: "OO", <child_model_id>, <parent_model_id>, ""
+		// Or: C: "OO", <child_model_id>, <parent_model_id>, "LimbNode" (for bones)
+		const allConnsList = allConns.nodes('C');
+		const objects = this.reader.node('Objects');
+		if (!objects) return hierarchy;
+
+		// Build a map of model ID -> bone name
+		const modelIdToName = new Map<number, string>();
+		for (const boneName of boneNames) {
+			// Find model with this name
+			const model = objects.nodes('Model').find(m => {
+				const name = m.prop(1, 'string');
+				return name === boneName || name?.replace(/^mixamorig:?/i, '') === boneName.replace(/^mixamorig:?/i, '');
+			});
+			if (model) {
+				const modelId = model.prop(0, 'number');
+				if (modelId !== undefined) {
+					modelIdToName.set(modelId, boneName);
+				}
+			}
+		}
+
+		// Process connections to find parent-child relationships
+		for (const conn of allConnsList) {
+			const childId = conn.prop(1, 'number');
+			const parentId = conn.prop(2, 'number');
+
+			// Only process "OO" (object-to-object) connections
+			const connType = conn.prop(0, 'string');
+			if (connType !== 'OO') continue;
+			if (childId === undefined || parentId === undefined) continue;
+
+			const childName = modelIdToName.get(childId);
+			const parentName = modelIdToName.get(parentId);
+
+			if (childName && parentName && hierarchy.has(childName) && hierarchy.has(parentName)) {
+				// Set parent-child relationship
+				const childHier = hierarchy.get(childName)!;
+				const parentHier = hierarchy.get(parentName)!;
+				childHier.parent = parentName;
+				parentHier.children.push(childName);
+			}
+		}
+
+		return hierarchy;
+	}
+
+	private getPreRotation(model: FBXReaderNode): number[] | null {
+		// Check Properties70 first (newer format)
+		// Properties70 format: P: "PreRotation", "Vector3D", "", "A", x, y, z
+		// So prop(4) = x, prop(5) = y, prop(6) = z
+		const props70 = model.node('Properties70');
+		if (props70) {
+			const preRotProp = props70.node('P', { 0: 'PreRotation' });
+			if (preRotProp) {
+				// Try as individual numbers first (Properties70 format)
+				const x = preRotProp.prop(4, 'number');
+				const y = preRotProp.prop(5, 'number');
+				const z = preRotProp.prop(6, 'number');
+				if (x !== undefined && y !== undefined && z !== undefined) {
+					return [x, y, z];
+				}
+				// Fallback: try as array
+				const rot = preRotProp.prop(4, 'number[]');
+				if (rot && rot.length >= 3) {
+					return [rot[0], rot[1], rot[2]];
+				}
+			}
+		}
+		// Also check direct property (older format)
+		const preRotDirect = model.node('PreRotation');
+		if (preRotDirect) {
+			const rot = preRotDirect.prop(0, 'number[]');
+			if (rot && rot.length >= 3) {
+				return [rot[0], rot[1], rot[2]];
+			}
+		}
+		return null;
+	}
+
+	private getPostRotation(model: FBXReaderNode): number[] | null {
+		// Check Properties70 first (newer format)
+		// Properties70 format: P: "PostRotation", "Vector3D", "", "A", x, y, z
+		// So prop(4) = x, prop(5) = y, prop(6) = z
+		const props70 = model.node('Properties70');
+		if (props70) {
+			const postRotProp = props70.node('P', { 0: 'PostRotation' });
+			if (postRotProp) {
+				// Try as individual numbers first (Properties70 format)
+				const x = postRotProp.prop(4, 'number');
+				const y = postRotProp.prop(5, 'number');
+				const z = postRotProp.prop(6, 'number');
+				if (x !== undefined && y !== undefined && z !== undefined) {
+					return [x, y, z];
+				}
+				// Fallback: try as array
+				const rot = postRotProp.prop(4, 'number[]');
+				if (rot && rot.length >= 3) {
+					return [rot[0], rot[1], rot[2]];
+				}
+			}
+		}
+		// Also check direct property (older format)
+		const postRotDirect = model.node('PostRotation');
+		if (postRotDirect) {
+			const rot = postRotDirect.prop(0, 'number[]');
+			if (rot && rot.length >= 3) {
+				return [rot[0], rot[1], rot[2]];
+			}
+		}
+		return null;
+	}
+
+	private getEulerOrder(): string {
+		// Always use ZXY rotation order
+		return 'ZXY';
+	}
+
+	private getLclRotation(model: FBXReaderNode): [number, number, number] | null {
+		// Check Properties70 first (newer format)
+		const props70 = model.node('Properties70');
+		if (props70) {
+			const lclRotProp = props70.node('P', { 0: 'Lcl Rotation' });
+			if (lclRotProp) {
+				const x = lclRotProp.prop(4, 'number');
+				const y = lclRotProp.prop(5, 'number');
+				const z = lclRotProp.prop(6, 'number');
+				if (x !== undefined && y !== undefined && z !== undefined) {
+					// Convert from degrees to radians
+					return [x * Math.PI / 180, y * Math.PI / 180, z * Math.PI / 180];
+				}
+			}
+		}
+		// Also check direct property (older format)
+		const lclRotDirect = model.node('Lcl Rotation');
+		if (lclRotDirect) {
+			const rot = lclRotDirect.prop(0, 'number[]');
+			if (rot && rot.length >= 3) {
+				// Convert from degrees to radians
+				return [rot[0] * Math.PI / 180, rot[1] * Math.PI / 180, rot[2] * Math.PI / 180];
+			}
+		}
+		return null;
+	}
+
+	private getLclTranslation(model: FBXReaderNode): [number, number, number] | null {
+		// Check Properties70 first (newer format)
+		const props70 = model.node('Properties70');
+		if (props70) {
+			const lclTransProp = props70.node('P', { 0: 'Lcl Translation' });
+			if (lclTransProp) {
+				const x = lclTransProp.prop(4, 'number');
+				const y = lclTransProp.prop(5, 'number');
+				const z = lclTransProp.prop(6, 'number');
+				if (x !== undefined && y !== undefined && z !== undefined) {
+					return [x, y, z];
+				}
+			}
+		}
+		// Also check direct property (older format)
+		const lclTransDirect = model.node('Lcl Translation');
+		if (lclTransDirect) {
+			const trans = lclTransDirect.prop(0, 'number[]');
+			if (trans && trans.length >= 3) {
+				return [trans[0], trans[1], trans[2]];
+			}
+		}
+		return null;
+	}
+
+	private parseCurveNode(curveNode: FBXReaderNode, modelName: string, preRotation: number[] | null = null, postRotation: number[] | null = null, eulerOrder: string = 'ZXY', restPose: BoneRestPose | null = null): BoneTrack | null {
+		const attrName = curveNode.prop(1, 'string') || '';
+
+		// Only parse rotation (quaternion) tracks
+		if (attrName !== 'R') return null;
+
+		// Find connected AnimationCurves
+		const connections = this.reader.node('Connections');
+		if (!connections) return null;
+
+		const curveNodeId = curveNode.prop(0, 'number');
+		if (curveNodeId === undefined) return null;
+
+		// Find connections where <to> is curveNodeId
+		const allConns = connections.nodes('C');
+		const curveConns = allConns.filter(c => {
+			const toId = c.prop(2, 'number');
+			return toId === curveNodeId;
+		});
+		
+		const curves: { x?: { times: number[], values: number[] }, y?: { times: number[], values: number[] }, z?: { times: number[], values: number[] } } = {};
+
+		for (const conn of curveConns) {
+			const relationship = conn.prop(3, 'string') || '';
+			// Connection format: C: "OO", <from>, <to>, <relationship>
+			// <from> is the curve ID
+			const curveId = conn.prop(1, 'number');
+			if (curveId === undefined) continue;
+
+			const objects = this.reader.node('Objects');
+			if (!objects) continue;
+
+			const curve = objects.node('AnimationCurve', { 0: curveId });
+			if (!curve) continue;
+
+			// Get key times and values
+			// These are stored as properties, not child nodes
+			// KeyTime is typically prop index 4, KeyValueFloat is prop index 5
+			// But let's search for them by name in child nodes first
+			const keyTime = curve.node('KeyTime');
+			const keyValueFloat = curve.node('KeyValueFloat');
+
+			// If not found as nodes, try as properties
+			let times: number[] = [];
+			let values: number[] = [];
+			
+			if (keyTime) {
+				const timeArray = keyTime.prop(0, 'number[]');
+				if (timeArray) {
+					times = timeArray.map(t => convertFBXTimeToSeconds(t));
+				}
+			} else {
+				// Try finding KeyTime in properties (usually index 4)
+				const timeProp = curve.prop(4, 'number[]');
+				if (timeProp) {
+					times = timeProp.map(t => convertFBXTimeToSeconds(t));
+				}
+			}
+
+			if (keyValueFloat) {
+				const valueArray = keyValueFloat.prop(0, 'number[]');
+				if (valueArray) {
+					values = valueArray;
+				}
+			} else {
+				// Try finding KeyValueFloat in properties (usually index 5)
+				const valueProp = curve.prop(5, 'number[]');
+				if (valueProp) {
+					values = valueProp;
+				}
+			}
+
+			if (times.length === 0 || values.length === 0) continue;
+			if (times.length !== values.length) {
+				console.warn(`parseCurveNode: times.length (${times.length}) !== values.length (${values.length}) for relationship "${relationship}"`);
+				continue;
+			}
+
+			// Match axis relationships more precisely (e.g., "d|X", "d|Y", "d|Z" or just "X", "Y", "Z")
+			// Check for exact axis match or axis at end of relationship string (after pipe separator)
+			if (relationship === 'X' || relationship.endsWith('|X')) {
+				curves.x = { times, values };
+			} else if (relationship === 'Y' || relationship.endsWith('|Y')) {
+				curves.y = { times, values };
+			} else if (relationship === 'Z' || relationship.endsWith('|Z')) {
+				curves.z = { times, values };
+			}
+		}
+
+		// Generate quaternion track
+		if (!curves.x || !curves.y || !curves.z) return null;
+
+		const { times, quats } = this.generateQuaternions({
+			x: curves.x,
+			y: curves.y,
+			z: curves.z
+		}, preRotation, postRotation, eulerOrder);
+		if (quats.length === 0) return null;
+
+		return {
+			name: modelName,
+			original_name: modelName,
+			times,
+			quats,
+			restPose
+		};
+	}
+
+	private parsePositionCurveNode(curveNode: FBXReaderNode, modelName: string): PositionTrack | null {
+		const attrName = curveNode.prop(1, 'string') || '';
+
+		// Only parse translation (T) tracks
+		if (attrName !== 'T') return null;
+
+		// Find connected AnimationCurves
+		const connections = this.reader.node('Connections');
+		if (!connections) return null;
+
+		const curveNodeId = curveNode.prop(0, 'number');
+		if (curveNodeId === undefined) return null;
+
+		// Find connections where <to> is curveNodeId
+		const allConns = connections.nodes('C');
+		const curveConns = allConns.filter(c => {
+			const toId = c.prop(2, 'number');
+			return toId === curveNodeId;
+		});
+		
+		const curves: { x?: { times: number[], values: number[] }, y?: { times: number[], values: number[] }, z?: { times: number[], values: number[] } } = {};
+
+		for (const conn of curveConns) {
+			const relationship = conn.prop(3, 'string') || '';
+			const curveId = conn.prop(1, 'number');
+			if (curveId === undefined) continue;
+
+			const objects = this.reader.node('Objects');
+			if (!objects) continue;
+
+			const curve = objects.node('AnimationCurve', { 0: curveId });
+			if (!curve) continue;
+
+			const keyTime = curve.node('KeyTime');
+			const keyValueFloat = curve.node('KeyValueFloat');
+			const keyValueDouble = curve.node('KeyValueDouble');
+
+			let times: number[] = [];
+			let values: number[] = [];
+			
+			if (keyTime) {
+				const timeArray = keyTime.prop(0, 'number[]');
+				if (timeArray) {
+					times = timeArray.map(t => convertFBXTimeToSeconds(t));
+				}
+			} else {
+				const timeProp = curve.prop(4, 'number[]');
+				if (timeProp) {
+					times = timeProp.map(t => convertFBXTimeToSeconds(t));
+				}
+			}
+
+			if (keyValueFloat) {
+				const valueArray = keyValueFloat.prop(0, 'number[]');
+				if (valueArray) {
+					values = valueArray;
+				}
+			} else if (keyValueDouble) {
+				const valueArray = keyValueDouble.prop(0, 'number[]');
+				if (valueArray) {
+					values = valueArray;
+				}
+			} else {
+				// Try property indices - check both float and double arrays
+				const valuePropFloat = curve.prop(5, 'number[]');
+				const valuePropDouble = curve.prop(5, 'number[]'); // Some FBX files use double precision
+				if (valuePropFloat && Array.isArray(valuePropFloat) && valuePropFloat.length > 0) {
+					values = valuePropFloat;
+				} else if (valuePropDouble && Array.isArray(valuePropDouble) && valuePropDouble.length > 0) {
+					values = valuePropDouble;
+				}
+			}
+
+			if (times.length === 0 || values.length === 0) continue;
+			if (times.length !== values.length) continue;
+
+			if (relationship === 'X' || relationship.endsWith('|X')) {
+				curves.x = { times, values };
+			} else if (relationship === 'Y' || relationship.endsWith('|Y')) {
+				curves.y = { times, values };
+			} else if (relationship === 'Z' || relationship.endsWith('|Z')) {
+				curves.z = { times, values };
+			}
+		}
+
+		if (!curves.x || !curves.y || !curves.z) return null;
+		if (curves.x.values.length === 0 || curves.y.values.length === 0 || curves.z.values.length === 0) return null;
+
+		const roundTime = (t: number) => Math.round(t * 1000000) / 1000000;
+		const allTimes = new Set<number>();
+		curves.x.times.forEach(t => allTimes.add(roundTime(t)));
+		curves.y.times.forEach(t => allTimes.add(roundTime(t)));
+		curves.z.times.forEach(t => allTimes.add(roundTime(t)));
+		const times = Array.from(allTimes).sort((a, b) => a - b);
+
+		const positions: [number, number, number][] = [];
+		for (const time of times) {
+			const x = this.interpolateValue(curves.x.times, curves.x.values, time);
+			const y = this.interpolateValue(curves.y.times, curves.y.values, time);
+			const z = this.interpolateValue(curves.z.times, curves.z.values, time);
+			positions.push([x, y, z]);
+		}
+
+		if (positions.length === 0) return null;
+
+		return {
+			name: modelName,
+			original_name: modelName,
+			times,
+			positions
+		};
+	}
+
+	private interpolateValue(times: number[], values: number[], targetTime: number): number {
+		if (times.length === 0 || values.length === 0) return 0;
+		if (times.length !== values.length) {
+			console.warn(`interpolateValue: times.length (${times.length}) !== values.length (${values.length})`);
+			return 0;
+		}
+		if (targetTime <= times[0]) return values[0];
+		if (targetTime >= times[times.length - 1]) return values[values.length - 1];
+
+		// Find surrounding keyframes
+		for (let i = 0; i < times.length - 1; i++) {
+			if (targetTime >= times[i] && targetTime <= times[i + 1]) {
+				const t = (targetTime - times[i]) / (times[i + 1] - times[i]);
+				return values[i] + (values[i + 1] - values[i]) * t;
+			}
+		}
+		return values[values.length - 1];
+	}
+
+	private generateQuaternions(curves: { x: { times: number[], values: number[] }, y: { times: number[], values: number[] }, z: { times: number[], values: number[] } }, _preRotation: number[] | null = null, _postRotation: number[] | null = null, eulerOrder: string = 'XYZ'): { times: number[], quats: Quat[] } {
+		// Interpolate rotations using quaternion slerp (like Three.js)
+		// This handles rotations >= 180 degrees properly
+		const interpolated = this.interpolateRotations(curves.x, curves.y, curves.z, eulerOrder);
+		const times = interpolated[0];
+		const values = interpolated[1];
+		
+		// NOTE: We do NOT apply PreRotation/PostRotation here.
+		// PreRotation/PostRotation define the bone's rest orientation in LOCAL space (relative to parent),
+		// not world space. The animation values are delta rotations from this rest pose.
+		// 
+		// The quaternions stored in FBX are in LOCAL_WITH_PARENT space (local to parent bone).
+		// This matches Blender's LOCAL_WITH_PARENT space, which is what we need for retargeting.
+		// 
+		// Applying PreRotation universally breaks bones that don't need it (like legs).
+		// Instead, we return RAW animation quaternions in local space and handle coordinate system
+		// conversion in retarget.ts based on bone type classification (invert_x, invert_z, etc.).
+		void _preRotation;
+		void _postRotation;
+		
+		const quats: Quat[] = [];
+		
+		// Validate that values.length is a multiple of 3
+		if (values.length % 3 !== 0) {
+			console.warn(`generateQuaternions: values.length (${values.length}) is not a multiple of 3`);
+			return { times: [], quats: [] };
+		}
+		
+		// Validate that times and values arrays match
+		if (times.length !== values.length / 3) {
+			console.warn(`generateQuaternions: times.length (${times.length}) !== values.length/3 (${values.length / 3})`);
+			return { times: [], quats: [] };
+		}
+		
+		// Convert Euler values to quaternions
+		for (let i = 0; i < values.length; i += 3) {
+			const xRad = values[i];
+			const yRad = values[i + 1];
+			const zRad = values[i + 2];
+			
+			// Convert Euler to quaternion using the model's eulerOrder
+			const quat = eulerToQuaternionByOrder(xRad, yRad, zRad, eulerOrder);
+			
+			let resultQuat = new Quat(quat.x, quat.y, quat.z, quat.w);
+			
+			// Handle quaternion unrolling (prevent flips between frames)
+			if (i > 0) {
+				const prevQuat = quats[quats.length - 1];
+				const dot = prevQuat.x * resultQuat.x + prevQuat.y * resultQuat.y + 
+				           prevQuat.z * resultQuat.z + prevQuat.w * resultQuat.w;
+				if (dot < 0) {
+					resultQuat = new Quat(-resultQuat.x, -resultQuat.y, -resultQuat.z, -resultQuat.w);
+				}
+			}
+			
+			quats.push(resultQuat);
+		}
+		
+
+		return { times, quats };
+	}
+	
+	// Interpolate rotations using quaternion slerp (like Three.js)
+	// This properly handles rotations >= 180 degrees by converting to quaternions first
+	// Merges all keyframe times from all three axes and interpolates each axis independently
+	private interpolateRotations(curvex: { times: number[], values: number[] }, curvey: { times: number[], values: number[] }, curvez: { times: number[], values: number[] }, eulerOrder: string): [number[], number[]] {
+		const times: number[] = [];
+		const values: number[] = [];
+		
+		// Merge all times from all three curves
+		// Round times to 6 decimal places to handle floating point precision issues
+		const roundTime = (t: number) => Math.round(t * 1000000) / 1000000;
+		const allTimes = new Set<number>();
+		curvex.times.forEach(t => allTimes.add(roundTime(t)));
+		curvey.times.forEach(t => allTimes.add(roundTime(t)));
+		curvez.times.forEach(t => allTimes.add(roundTime(t)));
+		const mergedTimes = Array.from(allTimes).sort((a, b) => a - b);
+		
+		if (mergedTimes.length === 0) return [[], []];
+		
+		// Interpolate each axis at each merged time
+		const interpolatedValues: Array<[number, number, number]> = [];
+		for (const time of mergedTimes) {
+			const xVal = this.interpolateValue(curvex.times, curvex.values, time);
+			const yVal = this.interpolateValue(curvey.times, curvey.values, time);
+			const zVal = this.interpolateValue(curvez.times, curvez.values, time);
+			interpolatedValues.push([xVal, yVal, zVal]);
+		}
+		
+		// Add first frame
+		if (interpolatedValues.length > 0) {
+			const first = interpolatedValues[0];
+			times.push(mergedTimes[0]);
+			values.push(degToRad(first[0]));
+			values.push(degToRad(first[1]));
+			values.push(degToRad(first[2]));
+		}
+		
+		// Process remaining frames with quaternion slerp for large rotations
+		for (let i = 1; i < interpolatedValues.length; i++) {
+			const initialValue = interpolatedValues[i - 1];
+			const currentValue = interpolatedValues[i];
+			
+			if (isNaN(initialValue[0]) || isNaN(initialValue[1]) || isNaN(initialValue[2]) ||
+			    isNaN(currentValue[0]) || isNaN(currentValue[1]) || isNaN(currentValue[2])) {
+				continue;
+			}
+			
+			const initialValueRad = initialValue.map(degToRad);
+			const currentValueRad = currentValue.map(degToRad);
+			
+			const valuesSpan = [
+				currentValue[0] - initialValue[0],
+				currentValue[1] - initialValue[1],
+				currentValue[2] - initialValue[2],
+			];
+			
+			const absoluteSpan = [
+				Math.abs(valuesSpan[0]),
+				Math.abs(valuesSpan[1]),
+				Math.abs(valuesSpan[2]),
+			];
+			
+			// If any axis has span >= 180, interpolate using quaternion slerp
+			if (absoluteSpan[0] >= 180 || absoluteSpan[1] >= 180 || absoluteSpan[2] >= 180) {
+				const maxAbsSpan = Math.max(...absoluteSpan);
+				const numSubIntervals = Math.ceil(maxAbsSpan / 180); // Use ceil to ensure smooth interpolation
+				
+				// Convert to quaternions
+				const E1 = eulerToQuaternionByOrder(initialValueRad[0], initialValueRad[1], initialValueRad[2], eulerOrder);
+				const E2 = eulerToQuaternionByOrder(currentValueRad[0], currentValueRad[1], currentValueRad[2], eulerOrder);
+				
+				const Q1 = new Quat(E1.x, E1.y, E1.z, E1.w);
+				let Q2 = new Quat(E2.x, E2.y, E2.z, E2.w);
+				
+				// Check unroll
+				if (Q1.x * Q2.x + Q1.y * Q2.y + Q1.z * Q2.z + Q1.w * Q2.w < 0) {
+					Q2 = new Quat(-Q2.x, -Q2.y, -Q2.z, -Q2.w);
+				}
+				
+				// Interpolate using slerp
+				const initialTime = mergedTimes[i - 1];
+				const timeSpan = mergedTimes[i] - initialTime;
+				const step = 1 / numSubIntervals;
+				
+				// Include intermediate frames (but not t=0, which is already added)
+				for (let t = step; t < 1; t += step) {
+					const Q = slerp(Q1, Q2, t);
+					const E = quaternionToEuler(Q);
+					
+					times.push(initialTime + t * timeSpan);
+					values.push(E.x);
+					values.push(E.y);
+					values.push(E.z);
+				}
+				// Always include the final frame (t=1)
+				times.push(mergedTimes[i]);
+				values.push(degToRad(currentValue[0]));
+				values.push(degToRad(currentValue[1]));
+				values.push(degToRad(currentValue[2]));
+			} else {
+				// No interpolation needed
+				times.push(mergedTimes[i]);
+				values.push(degToRad(currentValue[0]));
+				values.push(degToRad(currentValue[1]));
+				values.push(degToRad(currentValue[2]));
+			}
+		}
+		
+		return [times, values];
+	}
+}
+
+// Simple BinaryReader implementation
+class BinaryReader {
+	binary: Uint8Array;
+	offset: number;
+
+	constructor(binary: Uint8Array) {
+		this.binary = binary;
+		this.offset = 0;
+	}
+
+	readUint8(): number {
+		const value = this.binary[this.offset];
+		this.offset += 1;
+		return value;
+	}
+
+	readUint8AsBool(): boolean {
+		return this.readUint8() !== 0;
+	}
+
+	readUint8AsString(): string {
+		return String.fromCharCode(this.readUint8());
+	}
+
+	readUint8Array(length: number): Uint8Array {
+		const value = this.binary.slice(this.offset, this.offset + length);
+		this.offset += length;
+		return value;
+	}
+
+	readInt16(): number {
+		const value = new DataView(this.binary.buffer, this.offset, 2).getInt16(0, true);
+		this.offset += 2;
+		return value;
+	}
+
+	readInt32(): number {
+		const value = new DataView(this.binary.buffer, this.offset, 4).getInt32(0, true);
+		this.offset += 4;
+		return value;
+	}
+
+	readUint32(): number {
+		const value = new DataView(this.binary.buffer, this.offset, 4).getUint32(0, true);
+		this.offset += 4;
+		return value;
+	}
+
+	readUint64(): bigint {
+		const low = this.readUint32();
+		const high = this.readUint32();
+		return BigInt(high) * BigInt(0x100000000) + BigInt(low);
+	}
+
+	readInt64(): number {
+		const low = this.readUint32();
+		const high = this.readUint32();
+		
+		if (high & 0x80000000) {
+			// Negative number
+			const negLow = (~low + 1) & 0xFFFFFFFF;
+			const negHigh = (~high) & 0xFFFFFFFF;
+			if (negLow === 0) {
+				return -(Number(negHigh) * 0x100000000);
+			}
+			return -(Number(negHigh) * 0x100000000 + Number(negLow));
+		}
+		
+		return Number(high) * 0x100000000 + Number(low);
+	}
+
+	readFloat32(): number {
+		const value = new DataView(this.binary.buffer, this.offset, 4).getFloat32(0, true);
+		this.offset += 4;
+		return value;
+	}
+
+	readFloat64(): number {
+		const value = new DataView(this.binary.buffer, this.offset, 8).getFloat64(0, true);
+		this.offset += 8;
+		return value;
+	}
+
+	readArrayAsString(length: number): string {
+		const bytes = this.readUint8Array(length);
+		// Find null terminator
+		let nullIndex = bytes.indexOf(0);
+		if (nullIndex === -1) nullIndex = bytes.length;
+		return new TextDecoder().decode(bytes.slice(0, nullIndex));
+	}
+}
+
+// Binary Parser
+function parseBinary(binary: Uint8Array): FBXData {
+	const MAGIC = Uint8Array.from('Kaydara FBX Binary\x20\x20\x00\x1a\x00'.split(''), (v) => v.charCodeAt(0));
+	
+	if (binary.length < MAGIC.length) throw new Error('Not a binary FBX file');
+	const data = new BinaryReader(binary);
+	
+	const magic = data.readUint8Array(MAGIC.length).every((v, i) => v === MAGIC[i]);
+	if (!magic) throw new Error('Not a binary FBX file');
+	
+	const fbxVersion = data.readUint32();
+	const header64 = fbxVersion >= 7500;
+
+	const fbx: FBXData = [];
+
+	while (true) {
+		const subnode = readNode(data, header64);
+		if (subnode === null) break;
+		fbx.push(subnode);
+	}
+
+	return fbx;
+}
+
+function readNode(data: BinaryReader, header64: boolean): FBXNode | null {
+	const endOffset = header64 ? Number(data.readUint64()) : data.readUint32();
+	if (endOffset === 0) return null;
+	
+	const numProperties = header64 ? Number(data.readUint64()) : data.readUint32();
+	// Skip propertyListLen
+	if (header64) {
+		data.readUint64();
+	} else {
+		data.readUint32();
+	}
+	const nameLen = data.readUint8();
+	const name = data.readArrayAsString(nameLen);
+
+	const node: FBXNode = {
+		name,
+		props: [],
+		nodes: [],
+	};
+
+	// Properties
+	for (let i = 0; i < numProperties; ++i) {
+		node.props.push(readProperty(data));
+	}
+
+	// Node List
+	while (endOffset - data.offset > 13) {
+		const subnode = readNode(data, header64);
+		if (subnode !== null) node.nodes.push(subnode);
+	}
+	data.offset = endOffset;
+
+	return node;
+}
+
+function readProperty(data: BinaryReader): FBXProperty {
+	const typeCode = data.readUint8AsString();
+
+	let value: FBXProperty;
+
+	switch (typeCode) {
+		case 'Y':
+			value = data.readInt16();
+			break;
+		case 'C':
+			value = data.readUint8AsBool();
+			break;
+		case 'I':
+			value = data.readInt32();
+			break;
+		case 'F':
+			value = data.readFloat32();
+			break;
+		case 'D':
+			value = data.readFloat64();
+			break;
+		case 'L':
+			value = data.readInt64();
+			// Convert BigInt when possible
+			if (typeof value === 'number') {
+				if (value < Number.MIN_SAFE_INTEGER || value > Number.MAX_SAFE_INTEGER) {
+					// Keep as is
+				} else {
+					value = Number(value);
+				}
+			}
+			break;
+		case 'f':
+			value = readPropertyArray(data, (r) => r.readFloat32()) as number[];
+			break;
+		case 'd':
+			value = readPropertyArray(data, (r) => r.readFloat64()) as number[];
+			break;
+		case 'l':
+			value = readPropertyArray(data, (r) => r.readInt64()) as number[];
+			// Convert BigInt array when possible
+			for (let i = 0; i < value.length; ++i) {
+				const v = (value as number[])[i];
+				if (v < Number.MIN_SAFE_INTEGER || v > Number.MAX_SAFE_INTEGER) continue;
+				(value as number[])[i] = Number(v);
+			}
+			break;
+		case 'i':
+			value = readPropertyArray(data, (r) => r.readInt32()) as number[];
+			break;
+		case 'b':
+			value = readPropertyArray(data, (r) => r.readUint8AsBool()) as boolean[];
+			break;
+		case 'S':
+			value = data.readArrayAsString(data.readUint32());
+			// Replace '\x00\x01' by '::' and flip like in the text files
+			if (typeof value === 'string' && value.indexOf('\x00\x01') !== -1) {
+				value = value.split('\x00\x01').reverse().join('::');
+			}
+			break;
+		case 'R':
+			value = Array.from(data.readUint8Array(data.readUint32()));
+			break;
+		default:
+			throw new Error(`Unknown Property Type ${typeCode.charCodeAt(0)}`);
+	}
+
+	return value;
+}
+
+function readPropertyArray(data: BinaryReader, reader: (r: BinaryReader) => number | boolean): number[] | boolean[] {
+	const arrayLength = data.readUint32();
+	const encoding = data.readUint32();
+	const compressedLength = data.readUint32();
+	let arrayData = new BinaryReader(data.readUint8Array(compressedLength));
+
+	if (encoding === 1) {
+		// Decompress using pako
+		const decompressed = inflate(arrayData.binary);
+		arrayData = new BinaryReader(new Uint8Array(decompressed));
+	}
+
+	const value: (number | boolean)[] = [];
+	for (let i = 0; i < arrayLength; ++i) {
+		value.push(reader(arrayData));
+	}
+
+	return value as number[] | boolean[];
+}
+
+// Utility functions
+
+function convertFBXTimeToSeconds(time: number): number {
+	return time / 46186158000;
+}
+
+function degToRad(degrees: number): number {
+	return degrees * Math.PI / 180;
+}
+
+
+// Euler to Quaternion conversion function for ZXY order
+function eulerToQuaternionZXY(z: number, x: number, y: number): { x: number, y: number, z: number, w: number } {
+	const cz = Math.cos(z / 2);
+	const cx = Math.cos(x / 2);
+	const cy = Math.cos(y / 2);
+	const sz = Math.sin(z / 2);
+	const sx = Math.sin(x / 2);
+	const sy = Math.sin(y / 2);
+
+	return {
+		x: sx * cy * cz - cx * sy * sz,
+		y: cx * sy * cz + sx * cy * sz,
+		z: cx * cy * sz - sx * sy * cz,
+		w: cx * cy * cz + sx * sy * sz
+	};
+}
+
+// Helper to convert Euler to quaternion (always uses ZXY order)
+function eulerToQuaternionByOrder(x: number, y: number, z: number, _order: string): { x: number, y: number, z: number, w: number } {
+	// Always use ZXY order
+	if (_order !== 'ZXY') return { x: 0, y: 0, z: 0, w: 1 };
+	return eulerToQuaternionZXY(z, x, y);
+}
+
+// Quaternion slerp (spherical linear interpolation)
+function slerp(q1: Quat, q2: Quat, t: number): Quat {
+	const dot = q1.x * q2.x + q1.y * q2.y + q1.z * q2.z + q1.w * q2.w;
+	
+	// If dot < 0, negate one quaternion to take shorter path
+	let q2x = q2.x;
+	let q2y = q2.y;
+	let q2z = q2.z;
+	let q2w = q2.w;
+	
+	if (dot < 0) {
+		q2x = -q2x;
+		q2y = -q2y;
+		q2z = -q2z;
+		q2w = -q2w;
+	}
+	
+	// If quaternions are very close, use linear interpolation
+	if (Math.abs(dot) > 0.9995) {
+		const result = new Quat(
+			q1.x + (q2x - q1.x) * t,
+			q1.y + (q2y - q1.y) * t,
+			q1.z + (q2z - q1.z) * t,
+			q1.w + (q2w - q1.w) * t
+		);
+		// Normalize manually
+		const len = Math.sqrt(result.x * result.x + result.y * result.y + result.z * result.z + result.w * result.w);
+		if (len > 0) {
+			return new Quat(result.x / len, result.y / len, result.z / len, result.w / len);
+		}
+		return result;
+	}
+	
+	// Spherical linear interpolation
+	const theta = Math.acos(Math.abs(dot));
+	const sinTheta = Math.sin(theta);
+	const w1 = Math.sin((1 - t) * theta) / sinTheta;
+	const w2 = Math.sin(t * theta) / sinTheta;
+	
+	return new Quat(
+		w1 * q1.x + w2 * q2x,
+		w1 * q1.y + w2 * q2y,
+		w1 * q1.z + w2 * q2z,
+		w1 * q1.w + w2 * q2w
+	);
+}
+
+function quaternionToEuler(q: Quat): { x: number, y: number, z: number } {
+    const qx = q.x, qy = q.y, qz = q.z, qw = q.w;
+    
+    // R[2][1] = 2(qy*qz + qw*qx) = sin(rx)
+    const sinX = 2 * (qy * qz + qw * qx);
+    let rx: number, ry: number, rz: number;
+    
+    if (Math.abs(sinX) >= 0.9999) {
+        // Gimbal lock: X rotation is ±90°
+        // At gimbal lock, Y and Z rotations become coupled
+        // We can only determine Y+Z, so we arbitrarily set Z=0
+        rx = Math.sign(sinX) * Math.PI / 2;
+        rz = 0;
+        // Compute Y rotation from the remaining degrees of freedom
+        // R[0][1] = 2(qx*qy - qw*qz) = sin(ry+rz) at gimbal lock
+        // R[1][1] = 1 - 2(qx² + qz²) = cos(ry+rz) at gimbal lock
+        ry = Math.atan2(
+            2 * (qx * qy + qw * qz),  // Note: + instead of - due to gimbal lock
+            1 - 2 * (qy * qy + qz * qz)
+        );
+    } else {
+        rx = Math.asin(sinX);
+        // R[2][0] = 2(qx*qz - qw*qy)
+        // R[2][2] = 1 - 2(qx² + qy²)
+        // ry = atan2(-R[2][0], R[2][2])
+        ry = Math.atan2(
+            -(2 * (qx * qz - qw * qy)),
+            1 - 2 * (qx * qx + qy * qy)
+        );
+        
+        // R[0][1] = 2(qx*qy - qw*qz)
+        // R[1][1] = 1 - 2(qx² + qz²)
+        // rz = atan2(-R[0][1], R[1][1])
+        rz = Math.atan2(
+            -(2 * (qx * qy - qw * qz)),
+            1 - 2 * (qx * qx + qz * qz)
+        );
+    }
+    
+    return { x: rx, y: ry, z: rz };
+}
