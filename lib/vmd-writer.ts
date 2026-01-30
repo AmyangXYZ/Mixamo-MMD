@@ -121,6 +121,7 @@ export function convertToVMD(clip: RetargetedClip, fps: number = 30): Blob {
 	const positionTrackMap = new Map<string, RetargetedPositionTrack>();
 	clip.positionTracks?.forEach(track => positionTrackMap.set(track.name, track));
 
+
 	const keyframes: VMDBoneKeyframe[] = [];
 	const keyframeMap = new Map<string, Map<number, VMDBoneKeyframe>>();
 	
@@ -147,8 +148,8 @@ export function convertToVMD(clip: RetargetedClip, fps: number = 30): Blob {
 			} else {
 				position = new Vec3(0, 0, 0);
 			}
-			
-			const vmdPosition = new Vec3(position.x, -position.z, position.y);
+
+			const vmdPosition = position;
 			
 			boneKeyframes.set(frameNumber, {
 				boneName: track.name,
@@ -170,7 +171,9 @@ export function convertToVMD(clip: RetargetedClip, fps: number = 30): Blob {
 				const frameNumber = Math.round(time * fps);
 				const positionIdx = posTrack.times.findIndex(t => Math.abs(t - time) < 0.0001);
 				const position = positionIdx >= 0 ? posTrack.positions[positionIdx] : interpolatePosition(posTrack, time);
-				const vmdPosition = new Vec3(position.x, -position.z, position.y);
+				
+				// Write positions as-is (same format as playClipDirectly uses with moveBones)
+				const vmdPosition = position;
 				
 				boneKeyframes.set(frameNumber, {
 					boneName: posTrack.name,
