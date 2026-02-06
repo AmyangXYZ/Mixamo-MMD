@@ -47,7 +47,7 @@ export default function Home() {
         setVmdFileName(vmdFileName)
         
         await engine.loadAnimation(vmdUrl)
-        engine.setMorphWeight("抗穿模", 1.0)
+        engine.setMorphWeight("抗穿模", 0.5)
         
         const prog = engine.getAnimationProgress()
         setProgress(prog)
