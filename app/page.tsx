@@ -85,10 +85,10 @@ export default function Home() {
 
         setLoading(false)
         engine.runRenderLoop()
-        engine.setMorphWeight("抗穿模", 1.0)
+        engine.setMorphWeight("抗穿模", 0.5)
 
         // Auto-load demo FBX file
-        await loadFBXAndPlay("/fbx/Taunt.fbx", "Taunt.vmd")
+        await loadFBXAndPlay("/fbx/Rumba Dancing.fbx", "Rumba Dancing.vmd")
 
         setEngineError(null)
       } catch (error) {
@@ -219,6 +219,14 @@ export default function Home() {
       }
     }
   }, [initEngine])
+
+  useEffect(() => {
+    void (async () => {
+      if (engineRef.current && progress.percentage >= 100 && progress.duration > 0) {
+        handlePlay()
+      }
+    })()
+  }, [progress, handlePlay])
 
   return (
     <div className="fixed inset-0 w-full h-full overflow-hidden touch-none">

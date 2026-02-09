@@ -3,8 +3,8 @@ import type { AnimationClip, BoneTrack, PositionTrack } from './fbx';
 
 const BONE_MAP: Record<string, string> = {
 	'Hips': 'センター',
-	'Spine': '上半身',
-	'Spine1': '上半身3',
+	'Spine': '腰',
+	'Spine1': '上半身',
 	'Spine2': '上半身2',
 	'Neck': '首',
 	'Head': '頭',
