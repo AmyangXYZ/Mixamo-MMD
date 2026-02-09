@@ -279,7 +279,7 @@ export default function Home() {
 
           {/* GitHub Link */}
           <Button variant="outline" size="icon" asChild className="hover:bg-black hover:text-white rounded-full bg-black! size-7">
-            <Link href="https://github.com/AmyangXYZ/FBXtoVMD" target="_blank">
+            <Link href="https://github.com/AmyangXYZ/Mixamo-MMD" target="_blank">
               <Image src="/github-mark-white.svg" alt="GitHub" width={17} height={17} />
             </Link>
           </Button>
