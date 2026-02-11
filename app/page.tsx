@@ -34,6 +34,7 @@ export default function Home() {
     try {
       const fbxLoader = new FBXLoader()
       const rawClips = await fbxLoader.loadAsync(fbxUrl)
+      console.log(rawClips)
       
       const mmdClips = retargetClips(rawClips)
 

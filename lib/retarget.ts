@@ -207,6 +207,7 @@ export interface RetargetedPositionTrack {
 export interface RetargetedClip {
 	name: string;
 	duration: number;
+	fps: number;
 	boneTracks: RetargetedBoneTrack[];
 	positionTracks: RetargetedPositionTrack[];
 }
@@ -215,13 +216,34 @@ export interface RetargetedClip {
 export const POSITION_SCALE = 1 / 12.5;
 export const POSITION_OFFSET_Y = -8.3;
 
+/**
+ * Calculate duration from animation clip times
+ */
+function calculateDuration(clip: AnimationClip): number {
+	if (clip.duration > 0) return clip.duration;
+	
+	// Collect all unique times from all tracks
+	const allTimes = new Set<number>();
+	clip.tracks.forEach(track => track.times.forEach(t => allTimes.add(t)));
+	clip.positionTracks?.forEach(track => track.times.forEach(t => allTimes.add(t)));
+	
+	const sortedTimes = Array.from(allTimes).sort((a, b) => a - b);
+	if (sortedTimes.length === 0) return 0;
+	
+	return sortedTimes[sortedTimes.length - 1];
+}
+
 export function retargetClips(clips: AnimationClip[]): RetargetedClip[] {
-	return clips.map(clip => ({
-		name: clip.name,
-		duration: clip.duration,
-		boneTracks: clip.tracks.map(retargetBoneTrack),
-		positionTracks: (clip.positionTracks || []).map(retargetPositionTrack)
-	}));
+	return clips.map(clip => {
+		const duration = calculateDuration(clip);
+		return {
+			name: clip.name,
+			duration,
+			fps: 30, // Hardcoded to 30 FPS
+			boneTracks: clip.tracks.map(retargetBoneTrack),
+			positionTracks: (clip.positionTracks || []).map(retargetPositionTrack)
+		};
+	});
 }
 
 function mapBoneName(name: string): { mixamoName: string; mmdName: string } {
