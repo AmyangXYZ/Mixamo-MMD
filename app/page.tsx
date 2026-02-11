@@ -223,7 +223,7 @@ export default function Home() {
 
   useEffect(() => {
     void (async () => {
-      if (engineRef.current && progress.percentage >= 100 && progress.duration > 0) {
+      if (engineRef.current && progress.percentage >= 100 && progress.duration > 1/30) {
         handlePlay()
       }
     })()
