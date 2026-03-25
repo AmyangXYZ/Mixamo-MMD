@@ -1,6 +1,6 @@
 "use client"
 
-import { Engine, Vec3 } from "reze-engine"
+import { Engine, Model, Vec3 } from "reze-engine"
 import { useCallback, useEffect, useRef, useState } from "react"
 import Loading from "@/components/loading"
 import { FBXLoader } from "@/lib/fbx"
@@ -15,6 +15,7 @@ import Image from "next/image"
 export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const engineRef = useRef<Engine | null>(null)
+  const modelRef = useRef<Model | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [engineError, setEngineError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
@@ -27,7 +28,8 @@ export default function Home() {
 
   const loadFBXAndPlay = useCallback(async (fbxUrl: string, fileName?: string) => {
     const engine = engineRef.current
-    if (!engine) return
+    const model = modelRef.current
+    if (!engine || !model) return
 
     setConverting(true)
 
@@ -35,7 +37,7 @@ export default function Home() {
       const fbxLoader = new FBXLoader()
       const rawClips = await fbxLoader.loadAsync(fbxUrl)
       console.log(rawClips)
-      
+
       const mmdClips = retargetClips(rawClips)
 
       if (mmdClips.length > 0) {
@@ -43,17 +45,18 @@ export default function Home() {
         const vmd = convertToVMD(clip, 30)
         const vmdFileName = fileName || clip.name + '.vmd'
         const vmdUrl = getBlobURL(vmd)
-        
+
         setVmdBlob(vmd)
         setVmdFileName(vmdFileName)
-        
-        await engine.loadAnimation(vmdUrl)
-        engine.setMorphWeight("抗穿模", 0.5)
-        
-        const prog = engine.getAnimationProgress()
+
+        await model.loadAnimation("default", vmdUrl)
+        model.show("default")
+        model.setMorphWeight("抗穿模", 0.5)
+
+        const prog = model.getAnimationProgress()
         setProgress(prog)
-        
-        engine.playAnimation()
+
+        model.playAnimation()
         setIsPlaying(true)
         setIsPaused(false)
       }
@@ -72,21 +75,25 @@ export default function Home() {
           ambientColor: new Vec3(0.96, 0.88, 0.92),
           cameraDistance: 35,
           cameraTarget: new Vec3(0, 9, 0),
-          disablePhysics: true,
-          disableIK: true,
         })
         engineRef.current = engine
         await engine.init()
-        await engine.loadModel("/models/reze/reze.pmx")
+        const model = await engine.loadModel("/models/reze/reze.pmx")
+        modelRef.current = model
         engine.addGround({
           width: 200,
           height: 200,
+          fadeEnd: 100,
+          fadeStart: 50,
           diffuseColor: new Vec3(0.7, 0.7, 0.7),
         })
+        engine.setIKEnabled(false)
+        engine.setPhysicsEnabled(false)
+
 
         setLoading(false)
         engine.runRenderLoop()
-        engine.setMorphWeight("抗穿模", 0.5)
+        model.setMorphWeight("抗穿模", 0.5)
 
         // Auto-load demo FBX file
         await loadFBXAndPlay("/fbx/Rumba Dancing.fbx", "Rumba Dancing.vmd")
@@ -141,12 +148,12 @@ export default function Home() {
     let rafId: number | null = null
 
     const updateProgress = () => {
-      if (engineRef.current && isPlaying && !isPaused) {
-        const prog = engineRef.current.getAnimationProgress()
-        setProgress(prog)
+      if (modelRef.current && isPlaying && !isPaused) {
+        const prog = modelRef.current?.getAnimationProgress()
+        setProgress(prog || { current: 0, duration: 0, percentage: 0 })
 
         // Auto-pause when animation ends
-        if (prog.percentage >= 100) {
+        if (prog?.percentage >= 100) {
           setIsPlaying(false)
           setIsPaused(false)
         } else {
@@ -171,11 +178,11 @@ export default function Home() {
     if (engineRef.current) {
       // If animation has ended (at 100%), restart from beginning
       if (progress.percentage >= 100) {
-        engineRef.current.seekAnimation(0)
+        modelRef.current?.seekAnimation(0)
         setProgress({ ...progress, current: 0, percentage: 0 })
         await new Promise((resolve) => requestAnimationFrame(resolve))
       }
-      engineRef.current.playAnimation()
+      modelRef.current?.playAnimation()
       setIsPlaying(true)
       setIsPaused(false)
     }
@@ -183,16 +190,16 @@ export default function Home() {
 
   // Pause animation
   const handlePause = useCallback(() => {
-    if (engineRef.current) {
-      engineRef.current.pauseAnimation()
+    if (modelRef.current) {
+      modelRef.current.pauseAnimation()
       setIsPaused(true)
     }
   }, [])
 
   // Resume animation
   const handleResume = useCallback(() => {
-    if (engineRef.current) {
-      engineRef.current.playAnimation()
+    if (modelRef.current) {
+      modelRef.current.playAnimation()
       setIsPaused(false)
     }
   }, [])
@@ -202,7 +209,7 @@ export default function Home() {
     (value: number[]) => {
       if (engineRef.current && progress.duration > 0) {
         const seekTime = (value[0] / 100) * progress.duration
-        engineRef.current.seekAnimation(seekTime)
+        modelRef.current?.seekAnimation(seekTime)
         setProgress({ ...progress, current: seekTime, percentage: value[0] })
       }
     },
@@ -223,7 +230,7 @@ export default function Home() {
 
   useEffect(() => {
     void (async () => {
-      if (engineRef.current && progress.percentage >= 100 && progress.duration > 1/30) {
+      if (engineRef.current && progress.percentage >= 100 && progress.duration > 1 / 30) {
         handlePlay()
       }
     })()
@@ -256,7 +263,7 @@ export default function Home() {
             onChange={handleFileChange}
             className="hidden"
           />
-          <Button 
+          <Button
             onClick={handleUploadClick}
             disabled={loading || converting}
             size="sm"
@@ -296,7 +303,7 @@ export default function Home() {
       {loading && !engineError && <Loading loading={loading} />}
 
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full touch-none z-1 bg-[#a0a0a0]" />
-      
+
       {/* Player Controls */}
       {!loading && !engineError && vmdBlob && (
         <div className="absolute bottom-4 left-4 right-4 z-50">
