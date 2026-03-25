@@ -1,3 +1,14 @@
+# HKX Tagfile parser with spline-compressed animation decompression.
+#
+# HKX parsing based on hkx-parser by AltimorTASDK:
+#   https://github.com/AltimorTASDK/hkx-parser
+#   License: MIT
+#
+# Spline decompression algorithm based on HavokLib by Lukas Cone (PredatorCZ):
+#   https://github.com/PredatorCZ/HavokLib
+#   Source: hka_spline_decompressor.cpp / .hpp
+#   License: GPL-3.0
+
 import json
 import struct
 import sys
