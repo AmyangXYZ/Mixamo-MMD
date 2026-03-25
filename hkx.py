@@ -79,8 +79,7 @@ class IndentPrint():
     level = -1
     @staticmethod
     def print(*args, **kwargs):
-        print("    " * max(IndentPrint.level, 0), end="")
-        print(*args, **kwargs)
+        pass
 
 class Section():
     def __init__(self, flags, size, tag):
@@ -1035,6 +1034,14 @@ def decompress_spline_animation(anim):
     return all_frames
 
 
+def find_animation_container(value):
+    for nv in value.get('namedVariants', []):
+        v = nv.get('variant', {})
+        if isinstance(v, dict) and ('animations' in v or 'skeletons' in v):
+            return v
+    return None
+
+
 def main():
     if len(sys.argv) < 3:
         print("Usage: hkx.py <input.hkx> <output.json>", file=sys.stderr)
@@ -1047,20 +1054,31 @@ def main():
     read_sections(BufferReader(data), {'TAG0': hkx.TAG0})
     value = hkx.deserialize_item(hkx.data, hkx.items[1])
 
-    container = value['namedVariants'][1]['variant']
+    container = find_animation_container(value)
+    if not container:
+        print(f"ERROR: No animation container found in {sys.argv[1]}", file=sys.stderr)
+        sys.exit(1)
 
-    # Decompress animations and add frames to output
-    for anim in container.get('animations', []):
-        if anim.get('type') == 3:
+    skeletons = container.get('skeletons') or []
+    animations = container.get('animations') or []
+    bindings = container.get('bindings') or []
+
+    if not skeletons:
+        print(f"WARNING: No skeleton in {sys.argv[1]}, animation-only file", file=sys.stderr)
+
+    if not animations:
+        print(f"WARNING: No animations in {sys.argv[1]}", file=sys.stderr)
+
+    # Decompress spline-compressed animations
+    for anim in animations:
+        if anim.get('type') == 3 and 'data' in anim:
             frames = decompress_spline_animation(anim)
             anim['frames'] = frames
             anim['numDecompressedFrames'] = len(frames)
-            # drop raw data to keep JSON manageable
             del anim['data']
 
-    # Do the same for animations inside bindings (they reference the same objects
-    # in HKX but our deserializer may have inlined them)
-    for bind in container.get('bindings', []):
+    # Same for animations inlined inside bindings
+    for bind in bindings:
         ba = bind.get('animation')
         if ba and ba.get('type') == 3 and 'data' in ba and 'frames' not in ba:
             frames = decompress_spline_animation(ba)
@@ -1072,12 +1090,36 @@ def main():
         json.dump(value, f, indent=4)
 
     # Print summary
-    skel = container['skeletons'][0]
-    anim = container['animations'][0]
-    print(f"Skeleton: {skel['name']} ({len(skel['bones'])} bones)")
-    print(f"Animation: {anim['duration']}s, {anim['numDecompressedFrames']} frames, "
-          f"{anim['numberOfTransformTracks']} tracks")
+    print(f"Input:  {sys.argv[1]}")
     print(f"Output: {sys.argv[2]}")
+
+    for si, skel in enumerate(skeletons):
+        bones = skel.get('bones', [])
+        refs = skel.get('referencePose', [])
+        print(f"Skeleton[{si}]: \"{skel.get('name', '?')}\" — {len(bones)} bones, {len(refs)} refPose entries")
+
+    for ai, anim in enumerate(animations):
+        n_tracks = anim.get('numberOfTransformTracks', 0)
+        n_frames = anim.get('numDecompressedFrames', 0)
+        duration = anim.get('duration', 0)
+        fps = round(n_frames / duration) if duration > 0 and n_frames > 1 else 0
+        print(f"Animation[{ai}]: {duration:.3f}s, {n_frames} frames (~{fps}fps), {n_tracks} tracks")
+
+        # Per-track frame counts (translation/rotation/scale may differ due to static vs spline)
+        frames = anim.get('frames', [])
+        if frames and skeletons:
+            bone_names = [b['name'] for b in skeletons[0].get('bones', [])]
+            static_t, static_r, static_s = 0, 0, 0
+            for ti in range(min(n_tracks, len(bone_names))):
+                has_t = any(f[ti].get('translation') is not None for f in frames)
+                has_r = any(f[ti].get('rotation') is not None for f in frames)
+                has_s = any(f[ti].get('scale') is not None for f in frames)
+                if not has_t: static_t += 1
+                if not has_r: static_r += 1
+                if not has_s: static_s += 1
+            animated = n_tracks - max(static_t, static_r)
+            print(f"  Animated tracks: {animated}/{n_tracks} "
+                  f"(static: {static_t}T {static_r}R {static_s}S)")
 
 if __name__ == "__main__":
     main()

@@ -14,6 +14,7 @@
     "@radix-ui/react-slot": "^1.2.4",
     "@types/encoding-japanese": "^2.2.1",
     "@types/pako": "^2.0.4",
+    "@types/three": "^0.183.1",
     "@vercel/analytics": "^1.6.1",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
@@ -25,7 +26,8 @@
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "reze-engine": "^0.9.5",
-    "tailwind-merge": "^3.4.0"
+    "tailwind-merge": "^3.4.0",
+    "three": "^0.183.2"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
