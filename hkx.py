@@ -683,28 +683,29 @@ def read_quat_32bit(data, off):
     return (x, y, z, w), off + 4
 
 def read_quat_40bit(data, off):
-    mask = (1 << 11) - 1
+    # THREECOMP40: 12 bits per component, reconstructs dropped quaternion element
+    mask12 = (1 << 12) - 1
+    half = mask12 >> 1          # 2047
     fractal = 0.000345436
-    b0 = int.from_bytes(data[off:off+5], 'little')
-    c0 = b0 & 0xFFFFFFFF
-    c1 = b0 >> 24
+    cval = int.from_bytes(data[off:off+5], 'little')
 
-    v0 = ((c0 * (1 << 20)) >> 20) & 0x7FF
-    v1 = ((c0 * (1 << 8))  >> 20) & 0x7FF
-    v2 = ((c1 * (1 << 20)) >> 20) & 0x7FF
+    x = (cval & mask12) - half
+    y = ((cval >> 12) & mask12) - half
+    z = ((cval >> 24) & mask12) - half
+    shift = (cval >> 36) & 3
 
-    fv = [(v0 - mask) * fractal, (v1 - mask) * fractal, (v2 - mask) * fractal]
+    fv = [x * fractal, y * fractal, z * fractal]
+    retval = [0.0, 0.0, 0.0, 0.0]
+    for i in range(4):
+        if i < shift:   retval[i] = fv[i]
+        elif i > shift:  retval[i] = fv[i - 1]
+
     sq = fv[0]*fv[0] + fv[1]*fv[1] + fv[2]*fv[2]
-    fv.append(math.sqrt(max(0, 1.0 - sq)))
+    retval[shift] = math.sqrt(max(0, 1.0 - sq))
+    if (cval >> 38) & 1:
+        retval[shift] = -retval[shift]
 
-    shift = (b0 >> 36) & 3
-    if (b0 >> 38) & 1: fv[3] = -fv[3]
-
-    if shift == 0:   r = [fv[3], fv[0], fv[1], fv[2]]
-    elif shift == 1:  r = [fv[0], fv[3], fv[1], fv[2]]
-    elif shift == 2:  r = [fv[0], fv[1], fv[3], fv[2]]
-    else:             r = fv
-    return tuple(r), off + 5
+    return tuple(retval), off + 5
 
 def read_quat_48bit(data, off):
     mask = (1 << 15) - 1
@@ -824,8 +825,7 @@ def decompress_spline_animation(anim):
             any_pos_dynamic = any(s == STT_DYNAMIC for s in pos_stt)
 
             if any_pos_dynamic:
-                num_items = read_u8(raw, off); off += 1
-                off += 1  # padding byte
+                num_items = read_u16(raw, off); off += 2
                 degree = read_u8(raw, off); off += 1
                 knot_count = num_items + degree + 2
                 knots = [float(raw[off + i]) for i in range(knot_count)]
@@ -864,12 +864,12 @@ def decompress_spline_animation(anim):
                         static_pos[a] = read_f32(raw, off); off += 4
                 td['pos'] = {'type': 'static', 'value': static_pos, 'stt': pos_stt}
 
+            off = align_offset(off)
             # ── Rotation ──
             rot_quant = get_rot_quant(quant)
             rot_stt = get_rot_sub_track(rot_flags)
             if rot_stt == STT_DYNAMIC:
-                num_items = read_u8(raw, off); off += 1
-                off += 1
+                num_items = read_u16(raw, off); off += 2
                 degree = read_u8(raw, off); off += 1
                 knot_count = num_items + degree + 2
                 knots_r = [float(raw[off + i]) for i in range(knot_count)]
@@ -885,6 +885,11 @@ def decompress_spline_animation(anim):
                 td['rot'] = {'type': 'spline', 'degree': degree, 'knots': knots_r,
                              'cpoints': quat_cpoints, 'num_items': num_items}
             elif rot_stt == STT_STATIC:
+                # align before reading static quaternion (matches DSAnimStudio)
+                rot_align = {QT_32bit: 4, QT_40bit: 1, QT_48bit: 2,
+                             QT_24bit: 1, QT_16bitQuat: 2, QT_UNCOMPRESSED: 4}.get(rot_quant, 4)
+                if rot_align > 1:
+                    off = align_offset(off, rot_align)
                 q, off = read_quat(rot_quant, raw, off)
                 td['rot'] = {'type': 'static', 'value': q}
             else:
@@ -898,8 +903,7 @@ def decompress_spline_animation(anim):
             any_scale_dynamic = any(s == STT_DYNAMIC for s in scale_stt)
 
             if any_scale_dynamic:
-                num_items = read_u8(raw, off); off += 1
-                off += 1
+                num_items = read_u16(raw, off); off += 2
                 degree = read_u8(raw, off); off += 1
                 knot_count = num_items + degree + 2
                 knots_s = [float(raw[off + i]) for i in range(knot_count)]
@@ -937,8 +941,10 @@ def decompress_spline_animation(anim):
                         static_scale[a] = read_f32(raw, off); off += 4
                 td['scale'] = {'type': 'static', 'value': static_scale, 'stt': scale_stt}
 
+            off = align_offset(off)
             track_data.append(td)
 
+        off = align_offset(off, 16)
         # ── Evaluate at each frame ──
         block_time_start = block_idx * block_duration
         for frame_idx in range(frames_in_block):
