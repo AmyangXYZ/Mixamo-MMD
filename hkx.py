@@ -10,6 +10,7 @@
 #   License: GPL-3.0
 
 import json
+import os
 import struct
 import sys
 from itertools import chain
@@ -30,8 +31,8 @@ def reverse_extract64(value, start_bit, end_bit):
     return extract(value, 63 - end_bit, 63 - start_bit)
 
 class HkxException(Exception):
-    def __init__(*args, **kwargs):
-        super.__init__(*args, **kwargs)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
 class BufferReader():
     def __init__(self, data, *, offset=0):
@@ -174,11 +175,12 @@ class Type():
         return self.format & 31
 
 class Item():
-    def __init__(self, type, flags, offset, count):
+    def __init__(self, type, flags, offset, count, type_id=None):
         self.type = type
         self.flags = flags
         self.offset = offset
         self.count = count
+        self.type_id = type_id
         self.value = None
 
     def is_pointer(self):
@@ -487,15 +489,56 @@ class HkxParser():
         flags   = extract(type_and_flags, 24, 31)
         if type_id == 0:
             return None
-        typ = self.types[type_id]
+        typ = None
+        if self.types is not None and type_id < len(self.types):
+            typ = self.types[type_id]
         IndentPrint.print("item")
         IndentPrint.level += 1
-        IndentPrint.print(f"type   {typ.get_name()}")
+        if typ is not None:
+            IndentPrint.print(f"type   {typ.get_name()}")
+        else:
+            IndentPrint.print(f"typeId {type_id} (deferred)")
         IndentPrint.print(f"flags  {flags:02X}")
         IndentPrint.print(f"offset {offset:08X}")
         IndentPrint.print(f"count  {count}")
         IndentPrint.level -= 1
-        return Item(typ, flags, offset, count)
+        return Item(typ, flags, offset, count, type_id=type_id)
+
+    def resolve_item_types(self):
+        if self.items is None:
+            return
+        if self.types is None:
+            raise HkxException("Missing TYPE/TNA1 sections; cannot resolve item types")
+        for item in self.items:
+            if item is None or item.type is not None:
+                continue
+            if item.type_id is None or item.type_id >= len(self.types):
+                raise HkxException(f"Invalid item type id: {item.type_id}")
+            item.type = self.types[item.type_id]
+
+    def load_compendium(self, compendium_path):
+        with open(compendium_path, "rb") as f:
+            data = f.read()
+
+        reader = BufferReader(data)
+        while not reader.eof():
+            header = read_section(reader)
+            if header.tag != "TCM0":
+                reader.skip(header.data_size)
+                continue
+            inner = BufferReader(reader.read(header.data_size))
+            while not inner.eof():
+                section = read_section(inner)
+                if section.tag == "TYPE":
+                    type_reader = BufferReader(inner.read(section.data_size))
+                    read_sections(type_reader, {
+                        'TSTR': self.TSTR,
+                        'TNA1': self.TNA1,
+                        'FSTR': self.FSTR,
+                        'TBDY': self.TBDY
+                    })
+                else:
+                    inner.skip(section.data_size)
 
     def read_pointer(self, reader):
         return self.items[reader.unpack("<Q")[0]]
@@ -1052,6 +1095,15 @@ def main():
 
     hkx = HkxParser()
     read_sections(BufferReader(data), {'TAG0': hkx.TAG0})
+    if hkx.types is None:
+        input_dir = os.path.dirname(sys.argv[1]) or "."
+        for entry in sorted(os.listdir(input_dir)):
+            if not entry.endswith(".compendium"):
+                continue
+            hkx.load_compendium(os.path.join(input_dir, entry))
+            if hkx.types is not None:
+                break
+    hkx.resolve_item_types()
     value = hkx.deserialize_item(hkx.data, hkx.items[1])
 
     container = find_animation_container(value)

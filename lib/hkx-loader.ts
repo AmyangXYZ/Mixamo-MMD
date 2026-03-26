@@ -24,9 +24,20 @@ export interface HkxAnimation {
   frames: HkxFrameTransform[][]
 }
 
+function findContainer(json: Record<string, unknown>): Record<string, unknown> {
+  const variants = (json as { namedVariants?: { variant?: Record<string, unknown> }[] }).namedVariants ?? []
+  for (const entry of variants) {
+    const variant = entry?.variant
+    if (!variant) continue
+    if (Array.isArray(variant.skeletons) || Array.isArray(variant.animations) || Array.isArray(variant.bindings)) {
+      return variant
+    }
+  }
+  throw new Error("HKX JSON: missing animation container in namedVariants")
+}
+
 export function loadHkxJson(json: Record<string, unknown>): HkxAnimation {
-  const container = (json as { namedVariants: { name: string; variant: Record<string, unknown> }[] }).namedVariants[1]
-    .variant
+  const container = findContainer(json)
 
   const skel = (container.skeletons as Record<string, unknown>[])[0]
   const anim = (container.animations as Record<string, unknown>[])[0]
@@ -54,12 +65,4 @@ export function loadHkxJson(json: Record<string, unknown>): HkxAnimation {
     trackToBone,
     frames,
   }
-}
-
-export function getAvailableAnimations(): { id: string; name: string; category: string }[] {
-  const anims = [
-    { id: "a000_000000", category: "Idle" },
-    { id: "a000_003000", category: "Attack" },
-  ]
-  return anims.map((a) => ({ ...a, name: a.id }))
 }
