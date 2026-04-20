@@ -20,14 +20,13 @@ import { AdvancedDynamicTexture, TextBlock } from "@babylonjs/gui"
 import Loading from "@/components/loading"
 import { loadHkxJson, type HkxAnimation } from "@/lib/hkx-loader"
 import {
-  buildMmdArmSegmentDirectionsFromModel,
   computeHkxMmdFrame,
   computeHkxMmdFrameWithCtx,
   createRetargetContext,
   ER_BONE_MAP,
   logHkxSkeletonDefaultsToConsole,
-  logMmdRestSegmentDirectionsToConsole,
   retargetHkxClip,
+  retargetHkxClipWithCtx,
   type HkxRetargetContext,
 } from "@/lib/hkx-retarget"
 import { computeWorldPositions, HKX_IMPORTANT_BONES, loadAnimJson, type AnimData } from "@/lib/hkx-view"
@@ -110,7 +109,6 @@ export default function HkxComparePage() {
   const hkxRef = useRef<HkxAnimation | null>(null)
   const retargetCtxRef = useRef<HkxRetargetContext | null>(null)
   const loggedHkxExportRef = useRef(false)
-  const loggedMmdExportRef = useRef(false)
 
   const playRafRef = useRef<number | null>(null)
   const playStartRef = useRef(0)
@@ -304,6 +302,7 @@ export default function HkxComparePage() {
 
     for (let i = 0; i < anim.bones.length; i++) {
       const name = anim.bones[i].name
+      if (name === "L_Foot_Target2" || name === "R_Foot_Target2") continue
       const isMappable = MMD_MAPPABLE_BONES.has(name)
       if (!showNonMmdBonesRef.current && !isMappable) continue
       const isImportant = HKX_IMPORTANT_BONES.has(name)
@@ -400,23 +399,19 @@ export default function HkxComparePage() {
 
         hkxRef.current = hkx
         animDataRef.current = anim
-        const mmdArmDirs = modelRef.current ? buildMmdArmSegmentDirectionsFromModel(modelRef.current) : undefined
-        retargetCtxRef.current = createRetargetContext(hkx, { mmdArmDirections: mmdArmDirs })
+        const retargetCtx = createRetargetContext(hkx)
+        retargetCtxRef.current = retargetCtx
 
-        // One-shot: copy console → hkx-skeleton.json / mmd-skeleton-rest.json; disable refs after saving
+        // One-shot: uncomment to dump the ER skeleton JSON to the console.
         // if (!loggedHkxExportRef.current) {
         //   loggedHkxExportRef.current = true
         //   logHkxSkeletonDefaultsToConsole(hkx)
-        // }
-        // if (modelRef.current && !loggedMmdExportRef.current) {
-        //   loggedMmdExportRef.current = true
-        //   logMmdRestSegmentDirectionsToConsole(modelRef.current)
         // }
 
         const scene = sceneRef.current?.scene
         if (scene) buildSkeleton(anim, scene)
 
-        const clip = retargetHkxClip(hkx)
+        const clip = retargetHkxClipWithCtx(retargetCtx)
         setClipReady(clip.boneTracks.length > 0 || (clip.positionTracks?.length ?? 0) > 0)
         setClipDuration(hkx.duration)
         setTotalFrames(hkx.numFrames)
@@ -440,7 +435,8 @@ export default function HkxComparePage() {
   const handleExportVmd = useCallback(() => {
     const hkx = hkxRef.current
     if (!hkx) return
-    const clip = retargetHkxClip(hkx)
+    const ctx = retargetCtxRef.current
+    const clip = ctx ? retargetHkxClipWithCtx(ctx) : retargetHkxClip(hkx)
     const hasData = clip.boneTracks.length > 0 || (clip.positionTracks?.length ?? 0) > 0
     if (!hasData) return
     downloadBlob(convertToVMD(clip, 30), `${animId}_er_mmd.vmd`)
@@ -787,13 +783,13 @@ export default function HkxComparePage() {
         <div className="flex h-full min-h-0 w-full">
           <div ref={threeContainerRef} className="relative min-h-0 w-1/2 min-w-0 border-r border-white/10">
             <span className="pointer-events-none absolute left-2 top-2 z-10 text-[10px] uppercase tracking-wider text-white/50">
-              Babylon.js · ER FK
+              HKX Source
             </span>
             <canvas ref={threeCanvasRef} className="block h-full w-full touch-none" />
           </div>
           <div className="relative min-h-0 w-1/2 min-w-0">
             <span className="pointer-events-none absolute left-2 top-2 z-10 text-[10px] uppercase tracking-wider text-white/50">
-              reze · MMD (world Δ → MMD local)
+              MMD Retarget
             </span>
             <canvas ref={mmdCanvasRef} className="block h-full w-full touch-none" />
           </div>

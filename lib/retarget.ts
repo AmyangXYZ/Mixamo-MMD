@@ -152,7 +152,7 @@ const ARM_ANGLE = 35 * Math.PI / 180;
 const Q_ARM_L = Quat.fromAxisAngle(new Vec3(0, 0, 1), ARM_ANGLE);
 const Q_ARM_R = Quat.fromAxisAngle(new Vec3(0, 0, 1), -ARM_ANGLE);
 
-interface RetargetTransform {
+export interface RetargetTransform {
 	q_l: Quat;
 	q_r: Quat;
 }
@@ -189,6 +189,11 @@ function computeRetargetTransforms(): void {
 }
 
 computeRetargetTransforms();
+
+/** Same sandwich as `retargetBoneTrack` (Mixamo bind + A-pose arm bias); use with HKX arm deltas or absolutes. */
+export function getMixamoRetargetTransform(mixamoName: string): RetargetTransform | undefined {
+	return RETARGET_TRANSFORMS[mixamoName];
+}
 
 export interface RetargetedBoneTrack {
 	name: string;
